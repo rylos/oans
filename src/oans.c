@@ -583,8 +583,7 @@ static int print_metrics_json(char *filename)
 	 */
 	/* null, not absent, when no run has stored a configuration:
 	 * a consumer can test the key without guarding for it. */
-	printf("  \"scan_configured_dedupe\": %s,
-",
+	printf("  \"scan_configured_dedupe\": %s,\n",
 	       have_sc <= 0 ? "null" : sc.run_dedupe ? "true" : "false");
 	scan_config_free(&sc);
 	/*

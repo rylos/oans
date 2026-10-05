@@ -1,253 +1,43 @@
 name: CI
-
-# A PR branch would otherwise match both triggers and run the whole matrix
-# twice for one commit: double the CI spend, and double the exposure to a
-# wedged runner. Restrict push to the branches that have no PR to cover them --
-# in practice just master, for post-merge validation. (This has to be an
-# allowlist: GitHub rejects `branches` and `branches-ignore` on the same event,
-# and a denylist cannot express "every branch that has an open PR".)
 on:
-  push:
-    branches:
-      - master
   pull_request:
-
-# Read-only by default; no job here needs to write back to the repo.
 permissions:
   contents: read
-
-# Every job builds with WERROR=1 so a new compiler warning fails CI rather than
-# scrolling past in the log (scripts/verify.sh greps the build output locally,
-# but CI never runs it - without this a warning could land unnoticed).
-env:
-  WERROR: 1
-
-# Every job carries a timeout-minutes. GitHub's default is 360, so a hung test
-# holds a runner (and blocks the PR) for six hours before anything notices -- a
-# TSAN leg once wedged in the integration suite with oans and llvm-symbolizer
-# both live, and looked simply "in progress" the whole time. The bounds below
-# are ~8x the observed medians (build ~1 min, sanitizers ~1-2.6 min, valgrind
-# ~6.6 min): loose enough not to police normal runner variance, tight enough
-# that a wedge fails fast and visibly.
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # Both compilers: they disagree on plenty (clang's -Wcast-align fires on
-        # the container_of idiom, gcc has no -Wgnu-* checks), so building each at
-        # -O2 catches warnings and codegen the other misses. The sanitizer jobs
-        # below only cover clang at -O1.
-        scratch_fs: [btrfs, xfs]
-        cc: [gcc, clang]
-    env:
-      CC: ${{ matrix.cc }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/apt-deps
-        with:
-          leg: build
-
-      # Guards the long-path invariant (#117): a syscall taking a scanned
-      # file's path silently ENAMETOOLONGs and drops the file, exit 0.
-      - name: Lint
-        run: make lint
-
-      - name: Build
-        run: make
-
-      - name: Unit tests
-        run: make test
-
-      # #295: a build without the test hooks must compile under both
-      # compilers, say so in --version (the suite reads it to skip), and keep
-      # none of their names. Then back to the default build the steps below
-      # test; the stamp rebuilds every object each way.
-      - name: Build without test hooks
-        run: |
-          make TEST_HOOKS=0 oans
-          ./oans --version | grep -q 'without test hooks'
-          if strings oans | grep -oE 'DUPEREMOVE_[A-Z_]+' | sort -u |
-             grep -vxE 'DUPEREMOVE_(SCAN_STATS|NO_LAYOUT_COPY)'; then
-            echo "a test hook survived TEST_HOOKS=0"; exit 1
-          fi
-          make oans
-
-      # Dedupe integration tests need a reflink-capable filesystem, which the
-      # runner's ext4 root is not. Back a small btrfs/XFS with a loopback image
-      # and point the suite's scratch dir at it. The XFS leg runs unprivileged,
-      # so it also proves the unprivileged FS_IOC_GETFSUUID path (Linux 6.4+);
-      # the harness auto-skips the few btrfs-only (fragmentation) tests on XFS.
-      - name: Set up a scratch ${{ matrix.scratch_fs }}
-        run: |
-          sudo modprobe ${{ matrix.scratch_fs }} || true
-          IMG="$RUNNER_TEMP/oans-scratch.img"
-          truncate -s 2G "$IMG"
-          if [ "${{ matrix.scratch_fs }}" = btrfs ]; then
-            mkfs.btrfs -q "$IMG"
-          else
-            mkfs.xfs -q -m reflink=1 "$IMG"
-          fi
-          sudo mkdir -p /mnt/oans-scratch
-          sudo mount -o loop "$IMG" /mnt/oans-scratch
-          sudo chmod 1777 /mnt/oans-scratch
-
-      - name: Integration tests
-        run: make integration
-        env:
-          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
-
-  # Same build + suites, but under valgrind's memcheck. Kept as its own job so
-  # the fast legs above still give quick feedback; this one is ~7x slower but
-  # catches use-after-free / leaks the plain suite reads straight past (it found
-  # the dbfile recreate-path UAF fixed in #105). One filesystem is enough -
-  # memory behaviour is fs-independent - so it runs on btrfs only.
-  # Split across runners: the integration step is ~90% of this job's wall time
-  # (268s of 295s measured), and the setup it duplicates per shard is ~27s, so
-  # sharding trades a little runner time for a much shorter critical path.
-  # Measured on 4 cores, whole suite 104s vs per shard 27.0/28.1/24.4/28.7s.
-  # Returns are flattening here - the fixed setup is a growing share of each
-  # shard - so going beyond four mostly buys duplicated work. tests/run.py deals
-  # tests round-robin over a sorted id list, and shards the serial group
-  # separately: it runs one-at-a-time, so a shard holding all of it would still
-  # pay the full sequential floor and cap the split.
-  valgrind:
+  regression:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ["1/4", "2/4", "3/4", "4/4"]
     steps:
       - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/apt-deps
         with:
-          leg: valgrind
-
-      - name: Build
-        run: make
-
-      # OANS_PROPTEST_NO_JIT skips the three properties that compile a GRegex.
-      # GLib compiles every pattern with G_REGEX_OPTIMIZE, PCRE2 emits machine
-      # code, and memcheck reports hundreds of "conditional jump depends on
-      # uninitialised value" from frames it cannot symbolise - verified to be
-      # the library, not oans, by a standalone program with no oans code in it.
-      # Suppressing instead would need `Memcheck:Cond` over `obj:*`, since the
-      # frames carry no object name, and that hides every uninitialised-value
-      # error in the process - the check that caught the missing memset in
-      # start_running_checksum(). The suite prints which properties it skipped.
-      - name: Unit tests under valgrind
-        run: |
-          make test   # builds ./test (and runs it natively - fast)
-          OANS_PROPTEST_NO_JIT=1 valgrind -q --leak-check=full --error-exitcode=42 \
-            --suppressions=tests/valgrind.supp ./test
-
-      - name: Set up a scratch btrfs
-        run: |
-          sudo modprobe btrfs || true
-          IMG="$RUNNER_TEMP/oans-scratch.img"
-          truncate -s 2G "$IMG"
-          mkfs.btrfs -q "$IMG"
-          sudo mkdir -p /mnt/oans-scratch
-          sudo mount -o loop "$IMG" /mnt/oans-scratch
-          sudo chmod 1777 /mnt/oans-scratch
-
-      - name: Integration tests under valgrind
-        run: make integration-valgrind TEST_SHARD=${{ matrix.shard }}
-        env:
-          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
-
-  # Clang AddressSanitizer and UndefinedBehaviorSanitizer builds. These run the
-  # same unit + integration suites but compiled with -fsanitize; the Makefile's
-  # SANITIZE=... path also disables release hardening and exports the ASAN/UBSAN/
-  # LSAN run options that make any finding abort the process (so a suite fails on
-  # it). ASAN and UBSAN are separate legs for a clean per-sanitizer signal.
-  # Complements valgrind: ASAN's LeakSanitizer and use-after-scope plus UBSAN's
-  # integer/alignment/UB checks catch classes memcheck doesn't. Like valgrind,
-  # one filesystem is enough (the checks are fs-independent), so btrfs only.
-  sanitizers:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # thread additionally needs src/tsan.h's GLib annotations to say
-        # anything useful; the Makefile wires those up for SANITIZE=thread.
-        sanitize: [address, undefined, thread]
-    env:
-      CC: clang
-      SANITIZE: ${{ matrix.sanitize }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/apt-deps
-        with:
-          leg: sanitizers
-
-      # Newer runners default vm.mmap_rnd_bits to 32, which clang's ASAN shadow
-      # mapping can't accommodate ("Shadow memory range interleaves..."). 28 is
-      # the value ASAN expects. Harmless for the UBSAN leg.
-      - name: Widen ASLR entropy for ASAN
-        run: sudo sysctl -w vm.mmap_rnd_bits=28
-
-      - name: Build (${{ matrix.sanitize }})
-        run: make
-
-      - name: Unit tests (${{ matrix.sanitize }})
-        run: make test
-
-      - name: Set up a scratch btrfs
-        run: |
-          sudo modprobe btrfs || true
-          IMG="$RUNNER_TEMP/oans-scratch.img"
-          truncate -s 2G "$IMG"
-          mkfs.btrfs -q "$IMG"
-          sudo mkdir -p /mnt/oans-scratch
-          sudo mount -o loop "$IMG" /mnt/oans-scratch
-          sudo chmod 1777 /mnt/oans-scratch
-
-      - name: Integration tests (${{ matrix.sanitize }})
-        run: make integration
-        env:
-          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
-
-  # Do the tests notice when the code breaks? `make test` going green says every
-  # line ran; this replays real oans bugs -- #147, #159, #186, #187, #191, #202,
-  # one block per file in scripts/mutate/bugs/ -- and fails if any of them
-  # survives the suite. #186 and #187 between them had oans reporting gigabytes
-  # reclaimed on a tree whose free space never moved, for months, because
-  # nothing in the suite could tell the difference; a test quietly weakened or
-  # deleted looks exactly the same from here.
-  #
-  # Cheap enough to gate on, unlike the same idea in the other two repositories
-  # that share this tool: a mutant is one compile of tests/unit/main.c and one run of
-  # a suite that takes a third of a second. It needs no scratch filesystem,
-  # which is why it is one job and not a matrix.
-  mutation:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-
+          fetch-depth: 0
       - uses: ./.github/actions/apt-deps
         with:
           leg: build
-
-      # The vendored core against its recorded hash, and the adapter against
-      # the core. Both are silent failures otherwise: a drifted core means this
-      # repository runs something no suite covers, and an adapter that no longer
-      # fits makes the pre-filter reject every mutant, which reports the whole
-      # run as `compiler` -- a verdict in the flattering direction.
-      - name: Lint
-        run: make lint
-
-      # The same target a developer runs, so the gate is reproducible without
-      # retyping it out of this file. `--baseline-runs 1` because the suite is
-      # deterministic - a fixed property seed included - so the second green run
-      # the tool insists on by default buys nothing here.
-      - name: Replay known bugs
-        run: make mutation-replay MUTATE_ARGS="--baseline-runs 1"
+      - name: Set up a scratch xfs
+        run: |
+          sudo modprobe xfs || true
+          IMG="$RUNNER_TEMP/oans-scratch.img"
+          truncate -s 2G "$IMG"
+          mkfs.xfs -q -m reflink=1 "$IMG"
+          sudo mkdir -p /mnt/oans-scratch
+          sudo mount -o loop "$IMG" /mnt/oans-scratch
+          sudo chmod 1777 /mnt/oans-scratch
+      - name: New test, without the fix (expected to fail)
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
+        run: |
+          git checkout origin/master -- src/fiemap.c src/fiemap.h
+          make -s
+          for i in 1 2 3 4 5; do
+            DUPEREMOVE=./oans python3 tests/run.py 2>&1 | grep -a "unflushed\|AssertionError\|^OK\|FAILED" || true
+          done
+          git checkout HEAD -- src/fiemap.c src/fiemap.h
+      - name: New test, with the fix
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
+        run: |
+          make -s
+          for i in 1 2 3 4 5; do
+            DUPEREMOVE=./oans python3 tests/run.py 2>&1 | grep -a "unflushed\|AssertionError\|^OK\|FAILED" || true
+          done

@@ -370,7 +370,14 @@ class DuperemoveTest(unittest.TestCase):
     def tearDown(self):
         # Innermost first: a snapshot must go before the subvolume it lives in.
         for path in reversed(self._subvols):
-            btrfs_ok("subvolume", "delete", path)
+            if btrfs_ok("subvolume", "delete", path):
+                continue
+            # Unprivileged, the delete fails with EPERM unless the fs is
+            # mounted user_subvol_rm_allowed, and rmtree cannot unlink inside
+            # a read-only snapshot - so they piled up in the scratch dir. The
+            # owner may clear the flag, and an emptied subvolume rmdir()s.
+            btrfs_ok("property", "set", "-ts", path, "ro", "false")
+            shutil.rmtree(path, ignore_errors=True)
         shutil.rmtree(self.work, ignore_errors=True)
 
     # -- running oans ------------------------------------------------
@@ -673,7 +680,8 @@ class DuperemoveTest(unittest.TestCase):
     #
     # Subvolumes cannot be removed with rmtree (a read-only one refuses even
     # to have its files unlinked), so anything created here is tracked and
-    # deleted with the ioctl in tearDown, innermost first.
+    # deleted with the ioctl in tearDown, innermost first (or, where that
+    # needs privileges we lack, made writable and removed like a directory).
 
     def subvol(self, name):
         """Create a btrfs subvolume under the scratch dir; skips if it can't."""

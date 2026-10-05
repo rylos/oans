@@ -52,7 +52,12 @@
 
 static GMutex mutex;
 static GMutex console_mutex;
-static volatile unsigned long long total_dedupe_passes;
+/*
+ * The producer adds each batch's groups while workers print "(n/total)" under
+ * -v, so both are read across threads: atomic, relaxed - they order nothing,
+ * and a worker seeing the previous batch's total only prints a smaller one.
+ */
+static _Atomic unsigned long long total_dedupe_passes;
 /*
  * Groups push_results() found with fewer than two members, over the phase.
  * Producer thread only. One -v line at the end instead of one line per group:
@@ -61,7 +66,7 @@ static volatile unsigned long long total_dedupe_passes;
  */
 static unsigned long long single_groups_skipped;
 static volatile unsigned long long curr_dedupe_pass;
-static unsigned int leading_spaces;
+static _Atomic unsigned int leading_spaces;
 /*
  * Whether to measure the fiemap "net change in shared extents". It feeds only
  * the machine-readable line (non-tty or -q; see dedupe_phase_end), so on an
@@ -459,8 +464,12 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	if (verbose) {
 		g_mutex_lock(&console_mutex);
 		printf("[%p] (%0*llu/%llu) Try to dedupe extents with id ",
-		       g_thread_self(), leading_spaces, passno,
-		       total_dedupe_passes);
+		       g_thread_self(),
+		       (int)atomic_load_explicit(&leading_spaces,
+						 memory_order_relaxed),
+		       passno,
+		       atomic_load_explicit(&total_dedupe_passes,
+					    memory_order_relaxed));
 		debug_print_digest_short(stdout, dext->de_hash);
 		printf("\n");
 		g_mutex_unlock(&console_mutex);
@@ -1161,8 +1170,11 @@ void dedupe_push(struct dedupe_batch *b, bool whole_file)
 	if (RB_EMPTY_ROOT(&res->root))
 		return;
 
-	total_dedupe_passes += res->num_dupes;
-	leading_spaces = num_digits(total_dedupe_passes);
+	atomic_store_explicit(&leading_spaces,
+			      num_digits(atomic_fetch_add_explicit(
+				      &total_dedupe_passes, res->num_dupes,
+				      memory_order_relaxed) + res->num_dupes),
+			      memory_order_relaxed);
 
 	push_results(b, res, whole_file);
 }

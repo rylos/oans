@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -749,15 +750,6 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 	if (ret)
 		return ret;
 
-	if (strcmp("(null)", dbpath) != 0) {
-		/* longpath-ok: the hashfile itself. */
-	ret = chmod(dbpath, S_IRUSR|S_IWUSR);
-		if (ret) {
-			perror("setting db file permissions");
-			return ret;
-		}
-	}
-
 	/*
 	 * dbfile_identify() let only an empty file through unbranded, so one
 	 * without the brand here is new and ours: brand it before the strict
@@ -818,6 +810,35 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 #define MEMDB_FILENAME		"file::memory:?cache=shared"
 #define OPEN_FLAGS		(SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOMUTEX|SQLITE_OPEN_URI)
 #define OPEN_FLAGS_CREATE	(OPEN_FLAGS|SQLITE_OPEN_CREATE)
+
+/*
+ * Create a missing hashfile as 0600 before SQLite opens it. The hashfile
+ * lists every scanned path, and SQLite creates the -wal and -shm sidecars
+ * with the database file's mode: a chmod after the open left them at the
+ * umask's mode (0644 under 022) for the whole first scan, and for good if
+ * that run crashed. Only a file this run creates is chmod'ed - the mode of an
+ * existing hashfile is the admin's - and a failure there is a warning.
+ */
+static void precreate_hashfile(const char *filename)
+{
+	int fd;
+
+	/* A URI names its file in a form open(2) does not read. */
+	if (!strncmp(filename, "file:", 5))
+		return;
+
+	/* longpath-ok: the hashfile itself. */
+	fd = open(filename, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
+		  S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return;	/* there already, or SQLite reports why it is not */
+	/* A umask can only take bits away; this puts back exactly 0600. */
+	if (fchmod(fd, S_IRUSR | S_IWUSR))
+		/* escape-ok: oans's own --hashfile argument. */
+		eprintf("Warning: cannot set the mode of hashfile %s: %s\n",
+			filename, strerror(errno));
+	close(fd);
+}
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly)
 {
@@ -830,6 +851,9 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 		filename = MEMDB_FILENAME;
 		force_create = true;
 	}
+
+	if (force_create && !memdb)
+		precreate_hashfile(filename);
 
 	if (force_create)
 		ret = sqlite3_open_v2(filename, &db, OPEN_FLAGS_CREATE, NULL);

@@ -1055,6 +1055,10 @@ counterexample. No dependencies, one header, minunit-compatible.
       `FILEDUP_MEMBER`. Two copies of that rule can drift, and then the bar
       stops short or waits at 99% with nothing failing.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
+  SQLite creates them with the database file's mode, so a new hashfile is
+  created 0600 *before* `sqlite3_open_v2()` (`precreate_hashfile()`); a chmod
+  after the open left them 0644 for the first scan. An existing hashfile's
+  mode is its owner's: never chmod it on open.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`
   set guards it (a batch aborting here could silently empty the hashfile while

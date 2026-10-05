@@ -3783,8 +3783,15 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	/*
 	 * O_NOFOLLOW: every path queued here was stat'ed without following its
 	 * last component (#278), so a symlink now is one swapped in since.
+	 *
+	 * O_NOATIME: reading every file must not stamp every file as read,
+	 * which also costs a metadata write per file on a relatime mount. Only
+	 * the owner (or CAP_FOWNER) may ask, and that is per file, so an EPERM
+	 * is retried without it rather than remembered.
 	 */
-	ctxt.fd = longpath_open(file->path, O_RDONLY | O_NOFOLLOW);
+	ctxt.fd = longpath_open(file->path, O_RDONLY | O_NOFOLLOW | O_NOATIME);
+	if (ctxt.fd == -1 && errno == EPERM)
+		ctxt.fd = longpath_open(file->path, O_RDONLY | O_NOFOLLOW);
 	if (ctxt.fd == -1) {
 		declare_display_path(disp, file->path);
 

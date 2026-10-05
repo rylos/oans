@@ -1283,6 +1283,18 @@ databases all have that layout.
   got no row and was never extent-deduped. Repaired the same way, per row:
   `FILE_EOF_EXTENT_CHECKED` (`flags & 8`), checked in the same fiemap as the
   bit above (`scan_row_ok()`); `FILE_SCAN_CHECKED` is both.
+- **An extent's digest leaves out the hole before it.** The scan skips only
+  whole hash blocks of hole, so a hole that does not fill them is read as
+  zeroes, and `get_extent()` answers the *next* extent for an offset in it.
+  `process_extents()` hashed those zeroes into that extent, whose row still
+  said `fe_logical`/`fe_length`: one 64 KiB extent behind 32K, 64K and 128K
+  holes got three digests and was never extent-deduped. It steps over the gap
+  now; file digest and block hashes are unchanged (checked byte-identical).
+  Repaired per row by `FILE_HOLE_EXTENT_CHECKED` (`flags & 16`): rehashed when
+  a data extent follows a gap that is unaligned to the hash block or follows a
+  preallocated extent - wider than the exact cases, on purpose. A checkpoint
+  an older binary wrote in such a hole carries extent state that started
+  before its extent (`ext_loff >= loff`), and `adopt_resume()` refuses it.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 

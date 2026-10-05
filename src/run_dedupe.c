@@ -53,6 +53,13 @@
 static GMutex mutex;
 static GMutex console_mutex;
 static volatile unsigned long long total_dedupe_passes;
+/*
+ * Groups push_results() found with fewer than two members, over the phase.
+ * Producer thread only. One -v line at the end instead of one line per group:
+ * the loaders are not meant to produce them, and when GET_DUPLICATE_FILES did
+ * (a window holding only a group's target) a first scan printed thousands.
+ */
+static unsigned long long single_groups_skipped;
 static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
 /*
@@ -1059,9 +1066,15 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 			g_ptr_array_add(batch->held, extent->e_file);
 		}
 
+		/*
+		 * Nothing to dedupe, and nothing to settle on the progress bar:
+		 * dext_work() is 0 at one member, and the upfront total counts
+		 * groups, never a window's share of one.
+		 */
 		if (dext->de_num_dupes < 2) {
-			qprintf("Skipping extent - insufficient duplicates (%u)\n",
-				   dext->de_num_dupes);
+			dprintf("Skipping extent - insufficient duplicates (%u)\n",
+				dext->de_num_dupes);
+			single_groups_skipped++;
 			continue;
 		}
 		if (nr < res->num_dupes)	/* nr > num_dupes can't happen */
@@ -1265,6 +1278,7 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	report_net_shared = !isatty(STDOUT_FILENO);
 	curr_dedupe_pass = 0;
 	total_dedupe_passes = 0;
+	single_groups_skipped = 0;
 	open_batch = NULL;
 	watermark_frozen = false;
 	inflight_count = 0;
@@ -1327,6 +1341,10 @@ void dedupe_phase_end(void)
 
 	pdedupe_end();
 	pdedupe_counters(&groups, &reclaimed, &net_shared);
+
+	if (single_groups_skipped)
+		vprintf("%llu groups skipped: fewer than two members loaded\n",
+			single_groups_skipped);
 
 	/*
 	 * Name only the causes that actually occurred: three numbers where two
